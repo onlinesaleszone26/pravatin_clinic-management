@@ -1,0 +1,894 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Pillar 0: Global Default-Deny Catch-All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // GLOBAL PRIMITIVES & IDENTITY HELPERS (Phase 3)
+    // =========================================================================
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidString(val, minLen, maxLen) {
+      return val is string && val.size() >= minLen && val.size() <= maxLen;
+    }
+
+    function isOptionalString(data, key, maxLen) {
+      return !(key in data) || (data[key] is string && data[key].size() <= maxLen);
+    }
+
+    function isOptionalNumber(data, key) {
+      return !(key in data) || (data[key] is int || data[key] is float);
+    }
+
+    function isOptionalBool(data, key) {
+      return !(key in data) || data[key] is bool;
+    }
+
+    function isValidAuthorizedUids(uids, ownerUid) {
+      return uids is list
+        && uids.size() >= 1
+        && uids.size() <= 50
+        && uids[0] is string
+        && ownerUid in uids;
+    }
+
+    // Bootstrapped Super Admin check (no DB lookup - safe for list & get)
+    function isBootstrappedSuperAdmin() {
+      return isVerified() && request.auth.token.email == 'admin@example.com';
+    }
+
+    // Full Super Admin check (single-doc operations only, never used inside allow list)
+    function isSuperAdmin() {
+      return isBootstrappedSuperAdmin()
+        || (isVerified() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    // =========================================================================
+    // MASTER GATE TENANT HELPERS (Single-Doc Operations ONLY - Never in list)
+    // =========================================================================
+    function orgExists(orgId) {
+      return exists(/databases/$(database)/documents/organizations/$(orgId));
+    }
+
+    function getOrg(orgId) {
+      return get(/databases/$(database)/documents/organizations/$(orgId)).data;
+    }
+
+    function isOrgActive(orgId) {
+      return orgExists(orgId) && getOrg(orgId).status != 'suspended';
+    }
+
+    function isOrgOwner(orgId) {
+      return isVerified() && orgExists(orgId) && getOrg(orgId).ownerUid == request.auth.uid;
+    }
+
+    function memberExists(orgId) {
+      return exists(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid));
+    }
+
+    function getMember(orgId) {
+      return get(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid)).data;
+    }
+
+    function isActiveMember(orgId) {
+      return isVerified() && isOrgActive(orgId) && (
+        getOrg(orgId).ownerUid == request.auth.uid ||
+        (memberExists(orgId) && getMember(orgId).status == 'active')
+      );
+    }
+
+    function isOrgAdminOrOwner(orgId) {
+      return isVerified() && isOrgActive(orgId) && (
+        getOrg(orgId).ownerUid == request.auth.uid ||
+        (memberExists(orgId) && getMember(orgId).status == 'active' && getMember(orgId).role in ['clinic_owner', 'clinic_admin'])
+      );
+    }
+
+    function hasMemberRole(orgId, allowedRoles) {
+      return isVerified() && isOrgActive(orgId) && (
+        getOrg(orgId).ownerUid == request.auth.uid ||
+        (memberExists(orgId) && getMember(orgId).status == 'active' && getMember(orgId).role in allowedRoles)
+      );
+    }
+
+    function isTenantBaseValid(data, orgId) {
+      return data.organizationId == orgId
+        && isValidId(data.organizationId)
+        && isValidId(data.ownerUid)
+        && isValidAuthorizedUids(data.authorizedUids, data.ownerUid)
+        && isValidId(data.createdByUid)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isTenantImmutable() {
+      return incoming().organizationId == existing().organizationId
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdByUid == existing().createdByUid
+        && incoming().createdAt == existing().createdAt;
+    }
+
+    // =========================================================================
+    // VALIDATION BLUEPRINTS (Pillar 2: Called on BOTH create and update)
+    // =========================================================================
+    function isValidAdminUser(data) {
+      return data.keys().hasAll(['uid', 'email', 'role', 'createdAt'])
+        && data.keys().hasOnly(['uid', 'email', 'role', 'createdAt'])
+        && isValidId(data.uid)
+        && isValidString(data.email, 3, 160)
+        && data.role == 'super_admin'
+        && data.createdAt is timestamp;
+    }
+
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'photoURL', 'phone', 'activeOrgId', 'language', 'theme', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && isValidString(data.email, 3, 160)
+        && isValidString(data.displayName, 1, 120)
+        && isOptionalString(data, 'photoURL', 500)
+        && isOptionalString(data, 'phone', 32)
+        && isOptionalString(data, 'activeOrgId', 128)
+        && (!('language' in data) || data.language in ['en', 'bn'])
+        && (!('theme' in data) || data.theme in ['light', 'dark'])
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidSubscriptionPlan(data) {
+      return data.keys().hasAll(['name', 'code', 'monthlyPrice', 'yearlyPrice', 'doctorLimit', 'patientLimit', 'isPublic', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'code', 'audience', 'monthlyPrice', 'yearlyPrice', 'currency', 'trialDays', 'doctorLimit', 'patientLimit', 'userLimit', 'branchLimit', 'storageGb', 'modules', 'isPublic', 'createdAt', 'updatedAt'])
+        && isValidString(data.name, 2, 80)
+        && data.code in ['starter', 'professional', 'enterprise', 'custom']
+        && isOptionalString(data, 'audience', 120)
+        && (data.monthlyPrice is int || data.monthlyPrice is float) && data.monthlyPrice >= 0
+        && (data.yearlyPrice is int || data.yearlyPrice is float) && data.yearlyPrice >= 0
+        && isOptionalString(data, 'currency', 10)
+        && isOptionalNumber(data, 'trialDays')
+        && (data.doctorLimit is int || data.doctorLimit is float) && data.doctorLimit >= 1
+        && (data.patientLimit is int || data.patientLimit is float) && data.patientLimit >= 1
+        && isOptionalNumber(data, 'userLimit')
+        && isOptionalNumber(data, 'branchLimit')
+        && isOptionalNumber(data, 'storageGb')
+        && (!('modules' in data) || (data.modules is list && data.modules.size() <= 20 && (data.modules.size() == 0 || data.modules[0] is string)))
+        && data.isPublic is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidPlatformSetting(data) {
+      return data.keys().hasAll(['platformName', 'defaultCurrency', 'defaultLanguage', 'maintenanceMode', 'isPublic', 'updatedAt'])
+        && data.keys().hasOnly(['platformName', 'contactEmail', 'contactPhone', 'defaultCurrency', 'defaultLanguage', 'smsProviderMode', 'whatsappProviderMode', 'paymentGatewayMode', 'maintenanceMode', 'isPublic', 'updatedAt'])
+        && isValidString(data.platformName, 2, 100)
+        && isOptionalString(data, 'contactEmail', 160)
+        && isOptionalString(data, 'contactPhone', 32)
+        && isValidString(data.defaultCurrency, 1, 10)
+        && data.defaultLanguage in ['en', 'bn']
+        && (!('smsProviderMode' in data) || data.smsProviderMode in ['disabled', 'test_mode', 'configured'])
+        && (!('whatsappProviderMode' in data) || data.whatsappProviderMode in ['disabled', 'test_mode', 'configured'])
+        && (!('paymentGatewayMode' in data) || data.paymentGatewayMode in ['manual', 'test_mode', 'configured'])
+        && data.maintenanceMode is bool
+        && data.isPublic is bool
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidTransaction(data) {
+      return data.keys().hasAll(['organizationId', 'organizationName', 'ownerUid', 'planId', 'planName', 'billingCycle', 'amount', 'currency', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['organizationId', 'organizationName', 'ownerUid', 'planId', 'planName', 'billingCycle', 'amount', 'currency', 'method', 'reference', 'status', 'createdAt', 'updatedAt'])
+        && isValidId(data.organizationId)
+        && isValidString(data.organizationName, 1, 140)
+        && isValidId(data.ownerUid)
+        && isValidString(data.planId, 1, 80)
+        && isValidString(data.planName, 1, 80)
+        && data.billingCycle in ['monthly', 'yearly']
+        && (data.amount is int || data.amount is float) && data.amount >= 0
+        && isValidString(data.currency, 1, 10)
+        && isOptionalString(data, 'method', 40)
+        && isOptionalString(data, 'reference', 100)
+        && data.status in ['pending', 'approved', 'refunded', 'overdue']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidOrganization(data) {
+      return data.keys().hasAll(['name', 'slug', 'type', 'ownerUid', 'authorizedUids', 'status', 'planId', 'currency', 'language', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'slug', 'type', 'ownerUid', 'authorizedUids', 'status', 'planId', 'billingCycle', 'address', 'phone', 'email', 'website', 'currency', 'timezone', 'language', 'prescriptionHeader', 'prescriptionFooter', 'invoiceFooter', 'enablePharmacy', 'enableInpatient', 'createdAt', 'updatedAt'])
+        && isValidString(data.name, 2, 140)
+        && isValidString(data.slug, 2, 80) && data.slug.matches('^[a-z0-9\\-]+$')
+        && data.type in ['clinic', 'diagnostic', 'hospital', 'chamber']
+        && isValidId(data.ownerUid)
+        && isValidAuthorizedUids(data.authorizedUids, data.ownerUid)
+        && data.status in ['active', 'trial', 'suspended']
+        && isValidString(data.planId, 1, 80)
+        && (!('billingCycle' in data) || data.billingCycle in ['monthly', 'yearly'])
+        && isOptionalString(data, 'address', 300)
+        && isOptionalString(data, 'phone', 32)
+        && isOptionalString(data, 'email', 160)
+        && isOptionalString(data, 'website', 200)
+        && data.currency in ['BDT', 'USD', 'EUR']
+        && isOptionalString(data, 'timezone', 64)
+        && data.language in ['en', 'bn']
+        && isOptionalString(data, 'prescriptionHeader', 400)
+        && isOptionalString(data, 'prescriptionFooter', 400)
+        && isOptionalString(data, 'invoiceFooter', 400)
+        && isOptionalBool(data, 'enablePharmacy')
+        && isOptionalBool(data, 'enableInpatient')
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidMember(data, orgId) {
+      return isTenantBaseValid(data, orgId)
+        && data.keys().hasAll(['organizationId', 'ownerUid', 'authorizedUids', 'uid', 'name', 'role', 'status', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['organizationId', 'ownerUid', 'authorizedUids', 'uid', 'staffCode', 'name', 'email', 'phone', 'role', 'customRoleName', 'department', 'designation', 'branchId', 'salary', 'joiningDate', 'shift', 'attendanceStatus', 'status', 'inviteId', 'createdByUid', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && isOptionalString(data, 'staffCode', 40)
+        && isValidString(data.name, 1, 120)
+        && isOptionalString(data, 'email', 160)
+        && isOptionalString(data, 'phone', 32)
+        && data.role in ['clinic_owner', 'clinic_admin', 'doctor', 'receptionist', 'nurse', 'lab_technician', 'pharmacist', 'accountant', 'hr_manager', 'patient']
+        && isOptionalString(data, 'customRoleName', 80)
+        && isOptionalString(data, 'department', 80)
+        && isOptionalString(data, 'designation', 80)
+        && isOptionalString(data, 'branchId', 128)
+        && isOptionalNumber(data, 'salary')
+        && isOptionalString(data, 'joiningDate', 32)
+        && isOptionalString(data, 'shift', 60)
+        && (!('attendanceStatus' in data) || data.attendanceStatus in ['present', 'absent', 'on_leave'])
+        && data.status in ['active', 'inactive']
+        && (!('inviteId' in data) || isValidId(data.inviteId));
+    }
+
+    function isValidCustomRole(data, orgId) {
+      return isTenantBaseValid(data, orgId)
+        && data.keys().hasAll(['organizationId', 'ownerUid', 'authorizedUids', 'name', 'permissions', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['organizationId', 'ownerUid', 'authorizedUids', 'name', 'baseRole', 'description', 'permissions', 'createdByUid', 'createdAt', 'updatedAt'])
+        && isValidString(data.name, 2, 80)
+        && isOptionalString(data, 'baseRole', 40)
+        && isOptionalString(data, 'description', 240)
+        && data.permissions is map;
+    }
+
+    function isValidBranch(data, orgId) {
+      return isTenantBaseValid(data, orgId)
+        && data.keys().hasAll(['organizationId', 'ownerUid', 'authorizedUids', 'name', 'code', 'status', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['organizationId', 'ownerUid', 'authorizedUids', 'name', 'code', 'address', 'phone', 'managerName', 'isMain', 'status', 'createdByUid', 'createdAt', 'updatedAt'])
+        && isValidString(data.name, 2, 120)
+        && isValidString(data.code, 2, 32)
+        && isOptionalString(data, 'address', 260)
+        && isOptionalString(data, 'phone', 32)
+        && isOptionalString(data, 'managerName', 100)
+        && isOptionalBool(data, 'isMain')
+        && data.status in ['active', 'inactive'];
+    }
+
+    function isValidPatient(data, orgId) {
+      return isTenantBaseValid(data, orgId)
+        && data.keys().hasAll(['organizationId', 'ownerUid', 'authorizedUids', 'patientCode', 'name', 'gender', 'phone', 'status', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['organizationId', 'ownerUid', 'authorizedUids', 'patientAuthUid', 'patientCode', 'name', 'gender', 'dob', 'age', 'bloodGroup', 'phone', 'email', 'address', 'emergencyContact', 'guardianName', 'medicalHistory', 'allergies', 'existingDiseases', 'assignedDoctorId', 'assignedDoctorName', 'branchId', 'notes', 'status', 'createdByUid', 'createdAt', 'updatedAt'])
+        && isOptionalString(data, 'patientAuthUid', 128)
+        && isValidString(data.patientCode, 2, 40)
+        && isValidString(data.name, 1, 120)
+        && data.gender in ['male', 'female', 'other']
+        && isOptionalString(data, 'dob', 20)
+        && isOptionalNumber(data, 'age')
+        && isOptionalString(data, 'bloodGroup', 10)
+        && isValidString(data.phone, 4, 32)
+        && isOptionalString(data, 'email', 160)
+        && isOptionalString(data, 'address', 300)
+        && isOptionalString(data, 'emergencyContact', 140)
+        && isOptionalString(data, 'guardianName', 120)
+        && isOptionalString(data, 'medicalHistory', 1500)
+        && isOptionalString(data, 'allergies', 500)
+        && isOptionalString(data, 'existingDiseases', 500)
+        && isOptionalString(data, 'assignedDoctorId', 128)
+        && isOptionalString(data, 'assignedDoctorName', 120)
+        && isOptionalString(data, 'branchId', 128)
+        && isOptionalString(data, 'notes', 1500)
+        && data.status in ['active', 'archived'];
+    }
+
+    function isValidDoctor(data, orgId) {
+      return isTenantBaseValid(data, orgId)
+        && data.keys().hasAll(['organizationId', 'ownerUid', 'authorizedUids', 'doctorCode', 'name', 'specialization', 'consultationFee', 'slotDurationMinutes', 'status', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['organizationId', 'ownerUid', 'authorizedUids', 'doctorCode', 'name', 'specialization', 'discipline', 'qualifications', 'registrationLabel', 'registrationNumber', 'phone', 'email', 'chamberInfo', 'branchId', 'consultationFee', 'followUpFee', 'experienceYears', 'slotDurationMinutes', 'availableDays', 'morningShift', 'eveningShift', 'breakTime', 'leaveDates', 'emergencyAvailable', 'status', 'createdByUid', 'createdAt', 'updatedAt'])
+        && isValidString(data.doctorCode, 2, 40)
+        && isValidString(data.name, 2, 120)
+        && isValidString(data.specialization, 2, 100)
+        && isOptionalString(data, 'discipline', 60)
+        && isOptionalString(data, 'qualifications', 200)
+        && isOptionalString(data, 'registrationLabel', 60)
+        && isOptionalString(data, 'registrationNumber', 80)
+        && isOptionalString(data, 'phone', 32)
+        && isOptionalString(data, 'email', 160)
+        && isOptionalString(data, 'chamberInfo', 240)
+        && isOptionalString(data, 'branchId', 128)
+        && (data.consultationFee is int || data.consultationFee is float) && data.consultationFee >= 0
+        && isOptionalNumber(data, 'followUpFee')
+        && isOptionalNumber(data, 'experienceYears')
+        && (data.slotDurationMinutes is int || data.slotDurationMinutes is float) && data.slotDurationMinutes >= 5 && data.slotDurationMinutes <= 180
+        && (!('availableDays' in data) || (data.availableDays is list && data.availableDays.size() <= 7 && (data.availableDays.size() == 0 || data.availableDays[0] is string)))
+        && isOptionalString(data, 'morningShift', 40)
+        && isOptionalString(data, 'eveningShift', 40)
+        && isOptionalString(data, 'breakTime', 40)
+        && (!('leaveDates' in data) || (data.leaveDates is list && data.leaveDates.size() <= 60 && (data.leaveDates.size() == 0 || data.leaveDates[0] is string)))
+        && isOptionalBool(data, 'emergencyAvailable')
+        && data.status in ['active', 'on_leave', 'inactive'];
+    }
+
+    function isValidAppointment(data, orgId) {
+      return isTenantBaseValid(data, orgId)
+        && data.keys().hasAll(['organizationId', 'ownerUid', 'authorizedUids', 'appointmentNumber', 'queueToken', 'patientId', 'patientName', 'doctorId', 'doctorName', 'date', 'timeSlot', 'type', 'consultationFee', 'status', 'paymentStatus', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['organizationId', 'ownerUid', 'authorizedUids', 'patientAuthUid', 'appointmentNumber', 'queueToken', 'patientId', 'patientName', 'patientPhone', 'doctorId', 'doctorName', 'branchId', 'date', 'timeSlot', 'type', 'consultationFee', 'status', 'paymentStatus', 'notes', 'followUpDate', 'followUpReason', 'createdByUid', 'createdAt', 'updatedAt'])
+        && isOptionalString(data, 'patientAuthUid', 128)
+        && isValidString(data.appointmentNumber, 2, 40)
+        && (data.queueToken is int || data.queueToken is float) && data.queueToken >= 1
+        && isValidId(data.patientId)
+        && isValidString(data.patientName, 1, 120)
+        && isOptionalString(data, 'patientPhone', 32)
+        && isValidId(data.doctorId)
+        && isValidString(data.doctorName, 1, 120)
+        && isOptionalString(data, 'branchId', 128)
+        && isValidString(data.date, 8, 20)
+        && isValidString(data.timeSlot, 3, 24)
+        && data.type in ['new', 'follow_up', 'emergency', 'teleconsult']
+        && (data.consultationFee is int || data.consultationFee is float) && data.consultationFee >= 0
+        && data.status in ['pending', 'confirmed', 'checked_in', 'in_consultation', 'completed', 'cancelled', 'no_show']
+        && data.paymentStatus in ['unpaid', 'partial', 'paid']
+        && isOptionalString(data, 'notes', 800)
+        && isOptionalString(data, 'followUpDate', 20)
+        && isOptionalString(data, 'followUpReason', 300);
+    }
+
+    function isValidPrescription(data, orgId) {
+      return isTenantBaseValid(data, orgId)
+        && data.keys().hasAll(['organizationId', 'ownerUid', 'authorizedUids', 'rxNumber', 'patientId', 'patientName', 'doctorId', 'doctorName', 'templateType', 'medicines', 'status', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['organizationId', 'ownerUid', 'authorizedUids', 'patientAuthUid', 'rxNumber', 'appointmentId', 'patientId', 'patientName', 'patientCode', 'patientAge', 'patientGender', 'doctorId', 'doctorName', 'doctorQualifications', 'doctorRegistration', 'templateType', 'vitals', 'chiefComplaints', 'clinicalFindings', 'diagnosis', 'investigationAdvice', 'treatmentPlan', 'medicines', 'followUpDate', 'digitalSignature', 'status', 'createdByUid', 'createdAt', 'updatedAt'])
+        && isOptionalString(data, 'patientAuthUid', 128)
+        && isValidString(data.rxNumber, 2, 40)
+        && isOptionalString(data, 'appointmentId', 128)
+        && isValidId(data.patientId)
+        && isValidString(data.patientName, 1, 120)
+        && isOptionalString(data, 'patientCode', 40)
+        && isOptionalNumber(data, 'patientAge')
+        && isOptionalString(data, 'patientGender', 20)
+        && isValidId(data.doctorId)
+        && isValidString(data.doctorName, 1, 120)
+        && isOptionalString(data, 'doctorQualifications', 200)
+        && isOptionalString(data, 'doctorRegistration', 120)
+        && data.templateType in ['general_a4', 'compact', 'homeopathy']
+        && (!('vitals' in data) || data.vitals is map)
+        && isOptionalString(data, 'chiefComplaints', 1000)
+        && isOptionalString(data, 'clinicalFindings', 1000)
+        && isOptionalString(data, 'diagnosis', 600)
+        && isOptionalString(data, 'investigationAdvice', 1000)
+        && isOptionalString(data, 'treatmentPlan', 1200)
+        && data.medicines is list && data.medicines.size() <= 30 && (data.medicines.size() == 0 || data.medicines[0] is map)
+        && isOptionalString(data, 'followUpDate', 20)
+        && isOptionalString(data, 'digitalSignature', 120)
+        && data.status in ['draft', 'finalized'];
+    }
+
+    function isValidLabTest(data, orgId) {
+      return isTenantBaseValid(data, orgId)
+        && data.keys().hasAll(['organizationId', 'ownerUid', 'authorizedUids', 'code', 'name', 'category', 'price', 'sampleType', 'status', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['organizationId', 'ownerUid', 'authorizedUids', 'code', 'name', 'category', 'price', 'sampleType', 'preparation', 'referenceRange', 'unit', 'description', 'status', 'createdByUid', 'createdAt', 'updatedAt'])
+        && isValidString(data.code, 2, 40)
+        && isValidString(data.name, 2, 140)
+        && isValidString(data.category, 1, 80)
+        && (data.price is int || data.price is float) && data.price >= 0
+        && isValidString(data.sampleType, 1, 60)
+        && isOptionalString(data, 'preparation', 240)
+        && isOptionalString(data, 'referenceRange', 120)
+        && isOptionalString(data, 'unit', 40)
+        && isOptionalString(data, 'description', 500)
+        && data.status in ['active', 'inactive'];
+    }
+
+    function isValidLabOrder(data, orgId) {
+      return isTenantBaseValid(data, orgId)
+        && data.keys().hasAll(['organizationId', 'ownerUid', 'authorizedUids', 'orderNumber', 'patientId', 'patientName', 'tests', 'totalPrice', 'status', 'history', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['organizationId', 'ownerUid', 'authorizedUids', 'patientAuthUid', 'orderNumber', 'patientId', 'patientName', 'patientCode', 'referringDoctorId', 'referringDoctorName', 'tests', 'totalPrice', 'status', 'technicianName', 'verifiedByName', 'verifiedAt', 'deliveredAt', 'history', 'createdByUid', 'createdAt', 'updatedAt'])
+        && isOptionalString(data, 'patientAuthUid', 128)
+        && isValidString(data.orderNumber, 2, 40)
+        && isValidId(data.patientId)
+        && isValidString(data.patientName, 1, 120)
+        && isOptionalString(data, 'patientCode', 40)
+        && isOptionalString(data, 'referringDoctorId', 128)
+        && isOptionalString(data, 'referringDoctorName', 120)
+        && data.tests is list && data.tests.size() >= 1 && data.tests.size() <= 25 && data.tests[0] is map
+        && (data.totalPrice is int || data.totalPrice is float) && data.totalPrice >= 0
+        && data.status in ['ordered', 'sample_pending', 'sample_collected', 'processing', 'completed', 'verified', 'delivered', 'cancelled']
+        && isOptionalString(data, 'technicianName', 120)
+        && isOptionalString(data, 'verifiedByName', 120)
+        && isOptionalString(data, 'verifiedAt', 40)
+        && isOptionalString(data, 'deliveredAt', 40)
+        && data.history is list && data.history.size() <= 40 && (data.history.size() == 0 || data.history[0] is map);
+    }
+
+    function isValidInvoice(data, orgId) {
+      return isTenantBaseValid(data, orgId)
+        && data.keys().hasAll(['organizationId', 'ownerUid', 'authorizedUids', 'invoiceNumber', 'patientId', 'patientName', 'items', 'subtotal', 'discount', 'taxRate', 'taxAmount', 'totalAmount', 'paidAmount', 'dueAmount', 'status', 'payments', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['organizationId', 'ownerUid', 'authorizedUids', 'patientAuthUid', 'invoiceNumber', 'patientId', 'patientName', 'patientCode', 'branchId', 'items', 'subtotal', 'discount', 'taxRate', 'taxAmount', 'totalAmount', 'paidAmount', 'dueAmount', 'status', 'payments', 'createdByUid', 'createdAt', 'updatedAt'])
+        && isOptionalString(data, 'patientAuthUid', 128)
+        && isValidString(data.invoiceNumber, 2, 40)
+        && isValidId(data.patientId)
+        && isValidString(data.patientName, 1, 120)
+        && isOptionalString(data, 'patientCode', 40)
+        && isOptionalString(data, 'branchId', 128)
+        && data.items is list && data.items.size() >= 1 && data.items.size() <= 30 && data.items[0] is map
+        && (data.subtotal is int || data.subtotal is float) && data.subtotal >= 0
+        && (data.discount is int || data.discount is float) && data.discount >= 0
+        && (data.taxRate is int || data.taxRate is float) && data.taxRate >= 0 && data.taxRate <= 100
+        && (data.taxAmount is int || data.taxAmount is float) && data.taxAmount >= 0
+        && (data.totalAmount is int || data.totalAmount is float) && data.totalAmount >= 0
+        && (data.paidAmount is int || data.paidAmount is float) && data.paidAmount >= 0
+        && (data.dueAmount is int || data.dueAmount is float) && data.dueAmount >= 0
+        && data.status in ['unpaid', 'partial', 'paid', 'refunded']
+        && data.payments is list && data.payments.size() <= 20 && (data.payments.size() == 0 || data.payments[0] is map);
+    }
+
+    function isValidExpense(data, orgId) {
+      return isTenantBaseValid(data, orgId)
+        && data.keys().hasAll(['organizationId', 'ownerUid', 'authorizedUids', 'title', 'category', 'amount', 'date', 'paymentMethod', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['organizationId', 'ownerUid', 'authorizedUids', 'title', 'category', 'amount', 'date', 'paymentMethod', 'vendor', 'branchId', 'notes', 'createdByUid', 'createdAt', 'updatedAt'])
+        && isValidString(data.title, 2, 140)
+        && isValidString(data.category, 1, 60)
+        && (data.amount is int || data.amount is float) && data.amount >= 0
+        && isValidString(data.date, 8, 20)
+        && isValidString(data.paymentMethod, 1, 40)
+        && isOptionalString(data, 'vendor', 120)
+        && isOptionalString(data, 'branchId', 128)
+        && isOptionalString(data, 'notes', 400);
+    }
+
+    function isValidPharmacyItem(data, orgId) {
+      return isTenantBaseValid(data, orgId)
+        && data.keys().hasAll(['organizationId', 'ownerUid', 'authorizedUids', 'brandName', 'genericName', 'purchasePrice', 'sellingPrice', 'stockQty', 'reorderLevel', 'expiryDate', 'status', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['organizationId', 'ownerUid', 'authorizedUids', 'brandName', 'genericName', 'manufacturer', 'batchNumber', 'barcode', 'supplierName', 'purchasePrice', 'sellingPrice', 'stockQty', 'reorderLevel', 'expiryDate', 'status', 'createdByUid', 'createdAt', 'updatedAt'])
+        && isValidString(data.brandName, 1, 120)
+        && isValidString(data.genericName, 1, 120)
+        && isOptionalString(data, 'manufacturer', 120)
+        && isOptionalString(data, 'batchNumber', 60)
+        && isOptionalString(data, 'barcode', 80)
+        && isOptionalString(data, 'supplierName', 120)
+        && (data.purchasePrice is int || data.purchasePrice is float) && data.purchasePrice >= 0
+        && (data.sellingPrice is int || data.sellingPrice is float) && data.sellingPrice >= 0
+        && (data.stockQty is int || data.stockQty is float) && data.stockQty >= 0
+        && (data.reorderLevel is int || data.reorderLevel is float) && data.reorderLevel >= 0
+        && isValidString(data.expiryDate, 8, 20)
+        && data.status in ['active', 'discontinued'];
+    }
+
+    function isValidBed(data, orgId) {
+      return isTenantBaseValid(data, orgId)
+        && data.keys().hasAll(['organizationId', 'ownerUid', 'authorizedUids', 'wardName', 'bedNumber', 'type', 'dailyRate', 'status', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['organizationId', 'ownerUid', 'authorizedUids', 'wardName', 'roomNumber', 'bedNumber', 'type', 'dailyRate', 'status', 'currentPatientId', 'currentPatientName', 'admittedAt', 'attendingDoctorName', 'nursingNotes', 'createdByUid', 'createdAt', 'updatedAt'])
+        && isValidString(data.wardName, 1, 80)
+        && isOptionalString(data, 'roomNumber', 40)
+        && isValidString(data.bedNumber, 1, 40)
+        && data.type in ['general_ward', 'semi_cabin', 'vip_cabin', 'icu']
+        && (data.dailyRate is int || data.dailyRate is float) && data.dailyRate >= 0
+        && data.status in ['available', 'occupied', 'maintenance']
+        && isOptionalString(data, 'currentPatientId', 128)
+        && isOptionalString(data, 'currentPatientName', 120)
+        && isOptionalString(data, 'admittedAt', 40)
+        && isOptionalString(data, 'attendingDoctorName', 120)
+        && isOptionalString(data, 'nursingNotes', 1000);
+    }
+
+    function isValidNotification(data, orgId) {
+      return isTenantBaseValid(data, orgId)
+        && data.keys().hasAll(['organizationId', 'ownerUid', 'authorizedUids', 'type', 'channel', 'recipientName', 'language', 'message', 'deliveryStatus', 'read', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['organizationId', 'ownerUid', 'authorizedUids', 'type', 'channel', 'recipientName', 'recipientContact', 'language', 'message', 'deliveryStatus', 'read', 'createdByUid', 'createdAt', 'updatedAt'])
+        && isValidString(data.type, 1, 60)
+        && data.channel in ['in_app', 'email', 'sms', 'whatsapp']
+        && isValidString(data.recipientName, 1, 120)
+        && isOptionalString(data, 'recipientContact', 120)
+        && data.language in ['en', 'bn']
+        && isValidString(data.message, 1, 800)
+        && data.deliveryStatus in ['queued', 'test_simulated', 'sent', 'failed']
+        && data.read is bool;
+    }
+
+    function isValidAuditLog(data, orgId) {
+      return data.keys().hasAll(['organizationId', 'ownerUid', 'authorizedUids', 'action', 'module', 'summary', 'actorUid', 'actorName', 'actorRole', 'createdAt'])
+        && data.keys().hasOnly(['organizationId', 'ownerUid', 'authorizedUids', 'action', 'module', 'entityId', 'summary', 'actorUid', 'actorName', 'actorRole', 'createdAt'])
+        && data.organizationId == orgId
+        && isValidId(data.organizationId)
+        && isValidId(data.ownerUid)
+        && isValidAuthorizedUids(data.authorizedUids, data.ownerUid)
+        && isValidString(data.action, 2, 80)
+        && isValidString(data.module, 2, 60)
+        && isOptionalString(data, 'entityId', 128)
+        && isValidString(data.summary, 2, 400)
+        && isValidId(data.actorUid)
+        && isValidString(data.actorName, 1, 120)
+        && isValidString(data.actorRole, 1, 40)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidStaffInvite(data) {
+      return data.keys().hasAll(['organizationId', 'organizationName', 'ownerUid', 'authorizedUids', 'invitedEmail', 'invitedName', 'role', 'inviteCode', 'status', 'expiresAt', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['organizationId', 'organizationName', 'ownerUid', 'authorizedUids', 'invitedEmail', 'invitedName', 'role', 'department', 'designation', 'branchId', 'inviteCode', 'status', 'expiresAt', 'acceptedByUid', 'acceptedAt', 'createdByUid', 'createdAt', 'updatedAt'])
+        && isValidId(data.organizationId)
+        && isValidString(data.organizationName, 2, 140)
+        && isValidId(data.ownerUid)
+        && isValidAuthorizedUids(data.authorizedUids, data.ownerUid)
+        && isValidString(data.invitedEmail, 5, 160)
+        && data.invitedEmail.matches('^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$')
+        && isValidString(data.invitedName, 1, 120)
+        && data.role in ['clinic_admin', 'doctor', 'receptionist', 'nurse', 'lab_technician', 'pharmacist', 'accountant', 'hr_manager', 'patient']
+        && isOptionalString(data, 'department', 80)
+        && isOptionalString(data, 'designation', 80)
+        && isOptionalString(data, 'branchId', 128)
+        && isValidString(data.inviteCode, 8, 32)
+        && data.status in ['pending', 'accepted', 'revoked']
+        && isValidString(data.expiresAt, 8, 40)
+        && isOptionalString(data, 'acceptedByUid', 128)
+        && isOptionalString(data, 'acceptedAt', 40)
+        && isValidId(data.createdByUid)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // =========================================================================
+    // TOP-LEVEL COLLECTIONS
+    // =========================================================================
+
+    match /admins/{uid} {
+      allow get: if isSignedIn() && isValidId(uid) && (request.auth.uid == uid || isBootstrappedSuperAdmin());
+      allow list: if isBootstrappedSuperAdmin();
+      allow create: if isBootstrappedSuperAdmin() && isValidId(uid) && isValidAdminUser(incoming()) && incoming().uid == uid && incoming().createdAt == request.time;
+      allow update, delete: if isBootstrappedSuperAdmin() && isValidId(uid);
+    }
+
+    // Pillar 6: Strict PII Isolation for User Profiles
+    match /users/{uid} {
+      allow get: if isSignedIn() && isValidId(uid) && (request.auth.uid == uid || isSuperAdmin());
+      allow list: if isBootstrappedSuperAdmin();
+      allow create: if isVerified() && isValidId(uid) && request.auth.uid == uid && isValidUserProfile(incoming()) && incoming().uid == uid && incoming().createdAt == request.time && incoming().updatedAt == request.time;
+      allow update: if isVerified() && isValidId(uid) && isValidUserProfile(incoming()) && incoming().uid == existing().uid && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && (
+        (request.auth.uid == uid && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'phone', 'activeOrgId', 'language', 'theme', 'updatedAt'])) ||
+        isSuperAdmin()
+      );
+      allow delete: if false;
+    }
+
+    match /subscriptionPlans/{planId} {
+      allow get: if isSignedIn() && isValidId(planId) && (existing().isPublic == true || isSuperAdmin());
+      allow list: if isSignedIn() && (existing().isPublic == true || isBootstrappedSuperAdmin());
+      allow create: if isSuperAdmin() && isValidId(planId) && isValidSubscriptionPlan(incoming()) && incoming().createdAt == request.time && incoming().updatedAt == request.time;
+      allow update: if isSuperAdmin() && isValidId(planId) && isValidSubscriptionPlan(incoming()) && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'audience', 'monthlyPrice', 'yearlyPrice', 'currency', 'trialDays', 'doctorLimit', 'patientLimit', 'userLimit', 'branchLimit', 'storageGb', 'modules', 'isPublic', 'updatedAt']);
+      allow delete: if isSuperAdmin() && isValidId(planId);
+    }
+
+    match /platformSettings/{settingId} {
+      allow get: if isSignedIn() && isValidId(settingId) && (existing().isPublic == true || isSuperAdmin());
+      allow list: if isSignedIn() && (existing().isPublic == true || isBootstrappedSuperAdmin());
+      allow create: if isSuperAdmin() && isValidId(settingId) && isValidPlatformSetting(incoming()) && incoming().updatedAt == request.time;
+      allow update: if isSuperAdmin() && isValidId(settingId) && isValidPlatformSetting(incoming()) && incoming().updatedAt == request.time && incoming().diff(existing()).affectedKeys().hasOnly(['platformName', 'contactEmail', 'contactPhone', 'defaultCurrency', 'defaultLanguage', 'smsProviderMode', 'whatsappProviderMode', 'paymentGatewayMode', 'maintenanceMode', 'isPublic', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    match /transactions/{txId} {
+      allow get: if isSignedIn() && isValidId(txId) && (existing().ownerUid == request.auth.uid || isSuperAdmin());
+      allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || isBootstrappedSuperAdmin());
+      allow create: if isVerified() && isValidId(txId) && isValidTransaction(incoming()) && incoming().createdAt == request.time && incoming().updatedAt == request.time && orgExists(incoming().organizationId) && (
+        (incoming().ownerUid == request.auth.uid && incoming().status == 'pending' && getOrg(incoming().organizationId).ownerUid == request.auth.uid) ||
+        isSuperAdmin()
+      );
+      allow update: if isSuperAdmin() && isValidId(txId) && isValidTransaction(incoming()) && incoming().organizationId == existing().organizationId && incoming().ownerUid == existing().ownerUid && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'reference', 'method', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // Verified Staff Invitations (Zero-Trust Email-Bound Onboarding)
+    match /staffInvites/{inviteId} {
+      allow get: if isSignedIn() && isValidId(inviteId) && (
+        existing().ownerUid == request.auth.uid ||
+        request.auth.uid in existing().authorizedUids ||
+        (isVerified() && request.auth.token.email == existing().invitedEmail)
+      );
+      allow list: if isSignedIn() && (
+        existing().ownerUid == request.auth.uid ||
+        request.auth.uid in existing().authorizedUids ||
+        (isVerified() && request.auth.token.email == existing().invitedEmail)
+      );
+      allow create: if isVerified() && isValidId(inviteId) && isValidStaffInvite(incoming()) && incoming().createdByUid == request.auth.uid && incoming().status == 'pending' && !('acceptedByUid' in incoming()) && incoming().createdAt == request.time && incoming().updatedAt == request.time && isOrgAdminOrOwner(incoming().organizationId) && incoming().ownerUid == getOrg(incoming().organizationId).ownerUid;
+      allow update: if isVerified() && isValidId(inviteId) && isValidStaffInvite(incoming()) && incoming().organizationId == existing().organizationId && incoming().ownerUid == existing().ownerUid && incoming().invitedEmail == existing().invitedEmail && incoming().role == existing().role && incoming().inviteCode == existing().inviteCode && incoming().createdByUid == existing().createdByUid && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && (
+        // Action 1: Clinic Owner/Admin revokes pending invite
+        (existing().status == 'pending' && incoming().status == 'revoked' && isOrgAdminOrOwner(existing().organizationId) && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])) ||
+        // Action 2: Invited verified user atomically accepts invite + joins org & members
+        (existing().status == 'pending' && incoming().status == 'accepted' && request.auth.token.email == existing().invitedEmail && incoming().acceptedByUid == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'acceptedByUid', 'acceptedAt', 'updatedAt']) && existsAfter(/databases/$(database)/documents/organizations/$(existing().organizationId)/members/$(request.auth.uid)) && request.auth.uid in getAfter(/databases/$(database)/documents/organizations/$(existing().organizationId)).data.authorizedUids)
+      );
+      allow delete: if isVerified() && isValidId(inviteId) && existing().status != 'accepted' && isOrgAdminOrOwner(existing().organizationId);
+    }
+
+    // =========================================================================
+    // MULTI-TENANT ORGANIZATIONS & SUBCOLLECTIONS
+    // =========================================================================
+    match /organizations/{orgId} {
+      allow get: if isSignedIn() && isValidId(orgId) && (
+        existing().ownerUid == request.auth.uid ||
+        request.auth.uid in existing().authorizedUids ||
+        isSuperAdmin()
+      );
+      allow list: if isSignedIn() && (
+        existing().ownerUid == request.auth.uid ||
+        request.auth.uid in existing().authorizedUids ||
+        isBootstrappedSuperAdmin()
+      );
+      allow create: if isVerified() && isValidId(orgId) && isValidOrganization(incoming()) && incoming().ownerUid == request.auth.uid && incoming().status in ['active', 'trial'] && incoming().createdAt == request.time && incoming().updatedAt == request.time;
+      allow update: if isVerified() && isValidId(orgId) && isValidOrganization(incoming()) && incoming().ownerUid == existing().ownerUid && incoming().createdAt == existing().createdAt && incoming().updatedAt == request.time && (
+        (existing().ownerUid == request.auth.uid && existing().status != 'suspended' && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'slug', 'type', 'authorizedUids', 'planId', 'billingCycle', 'address', 'phone', 'email', 'website', 'currency', 'timezone', 'language', 'prescriptionHeader', 'prescriptionFooter', 'invoiceFooter', 'enablePharmacy', 'enableInpatient', 'updatedAt'])) ||
+        (isSuperAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'status', 'planId', 'billingCycle', 'enablePharmacy', 'enableInpatient', 'updatedAt'])) ||
+        // Action 3: Atomic verified staff invite join (appends ONLY caller's own UID alongside member creation)
+        (existing().status != 'suspended' && !(request.auth.uid in existing().authorizedUids) && request.auth.uid in incoming().authorizedUids && incoming().authorizedUids.size() == existing().authorizedUids.size() + 1 && incoming().authorizedUids.hasAll(existing().authorizedUids) && incoming().diff(existing()).affectedKeys().hasOnly(['authorizedUids', 'updatedAt']) && existsAfter(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid)) && getAfter(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid)).data.uid == request.auth.uid)
+      );
+      allow delete: if false;
+
+      // -----------------------------------------------------------------------
+      // Clinic Members & Staff HR
+      // -----------------------------------------------------------------------
+      match /members/{memberUid} {
+        allow get: if isSignedIn() && isValidId(orgId) && isValidId(memberUid) && isActiveMember(orgId);
+        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || request.auth.uid in existing().authorizedUids);
+        allow create: if isVerified() && isValidId(orgId) && isValidId(memberUid) && isValidMember(incoming(), orgId) && incoming().uid == memberUid && incoming().createdByUid == request.auth.uid && incoming().createdAt == request.time && incoming().updatedAt == request.time && orgExists(orgId) && (
+          (getOrg(orgId).ownerUid == request.auth.uid && incoming().ownerUid == getOrg(orgId).ownerUid) ||
+          (isOrgAdminOrOwner(orgId) && incoming().ownerUid == getOrg(orgId).ownerUid && incoming().role != 'clinic_owner') ||
+          // Action 3: Invited verified user atomically creates own membership with exact invited role
+          (memberUid == request.auth.uid && isOrgActive(orgId) && 'inviteId' in incoming() && isValidId(incoming().inviteId) && exists(/databases/$(database)/documents/staffInvites/$(incoming().inviteId)) && get(/databases/$(database)/documents/staffInvites/$(incoming().inviteId)).data.organizationId == orgId && get(/databases/$(database)/documents/staffInvites/$(incoming().inviteId)).data.status == 'pending' && get(/databases/$(database)/documents/staffInvites/$(incoming().inviteId)).data.invitedEmail == request.auth.token.email && get(/databases/$(database)/documents/staffInvites/$(incoming().inviteId)).data.role == incoming().role && incoming().ownerUid == getOrg(orgId).ownerUid && incoming().status == 'active' && getAfter(/databases/$(database)/documents/staffInvites/$(incoming().inviteId)).data.status == 'accepted')
+        );
+        allow update: if isVerified() && isValidId(orgId) && isValidId(memberUid) && isValidMember(incoming(), orgId) && isTenantImmutable() && incoming().uid == existing().uid && incoming().updatedAt == request.time && (
+          // Action 1: Clinic Owner manages any member (cannot demote self from clinic_owner)
+          (isOrgOwner(orgId) && (memberUid != request.auth.uid || incoming().role == 'clinic_owner') && incoming().diff(existing()).affectedKeys().hasOnly(['authorizedUids', 'staffCode', 'name', 'email', 'phone', 'role', 'customRoleName', 'department', 'designation', 'branchId', 'salary', 'joiningDate', 'shift', 'attendanceStatus', 'status', 'updatedAt'])) ||
+          // Action 2: Clinic Admin / HR Manager manages non-owner staff ONLY (Anti-Escalation Guard)
+          (hasMemberRole(orgId, ['clinic_admin', 'hr_manager']) && existing().role != 'clinic_owner' && incoming().role != 'clinic_owner' && incoming().diff(existing()).affectedKeys().hasOnly(['authorizedUids', 'staffCode', 'name', 'email', 'phone', 'role', 'customRoleName', 'department', 'designation', 'branchId', 'salary', 'joiningDate', 'shift', 'attendanceStatus', 'status', 'updatedAt']))
+        );
+        allow delete: if isVerified() && isValidId(orgId) && isValidId(memberUid) && isOrgOwner(orgId) && memberUid != request.auth.uid;
+      }
+
+      // -----------------------------------------------------------------------
+      // Custom RBAC Roles
+      // -----------------------------------------------------------------------
+      match /roles/{roleId} {
+        allow get: if isSignedIn() && isValidId(orgId) && isValidId(roleId) && isActiveMember(orgId);
+        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || request.auth.uid in existing().authorizedUids);
+        allow create: if isVerified() && isValidId(orgId) && isValidId(roleId) && isValidCustomRole(incoming(), orgId) && incoming().createdByUid == request.auth.uid && incoming().createdAt == request.time && incoming().updatedAt == request.time && isOrgAdminOrOwner(orgId) && incoming().ownerUid == getOrg(orgId).ownerUid;
+        allow update: if isVerified() && isValidId(orgId) && isValidId(roleId) && isValidCustomRole(incoming(), orgId) && isTenantImmutable() && incoming().updatedAt == request.time && isOrgAdminOrOwner(orgId) && incoming().diff(existing()).affectedKeys().hasOnly(['authorizedUids', 'name', 'baseRole', 'description', 'permissions', 'updatedAt']);
+        allow delete: if isVerified() && isValidId(orgId) && isValidId(roleId) && isOrgAdminOrOwner(orgId);
+      }
+
+      // -----------------------------------------------------------------------
+      // Clinic Branches
+      // -----------------------------------------------------------------------
+      match /branches/{branchId} {
+        allow get: if isSignedIn() && isValidId(orgId) && isValidId(branchId) && isActiveMember(orgId);
+        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || request.auth.uid in existing().authorizedUids);
+        allow create: if isVerified() && isValidId(orgId) && isValidId(branchId) && isValidBranch(incoming(), orgId) && incoming().createdByUid == request.auth.uid && incoming().createdAt == request.time && incoming().updatedAt == request.time && isOrgAdminOrOwner(orgId) && incoming().ownerUid == getOrg(orgId).ownerUid;
+        allow update: if isVerified() && isValidId(orgId) && isValidId(branchId) && isValidBranch(incoming(), orgId) && isTenantImmutable() && incoming().updatedAt == request.time && isOrgAdminOrOwner(orgId) && incoming().diff(existing()).affectedKeys().hasOnly(['authorizedUids', 'name', 'code', 'address', 'phone', 'managerName', 'isMain', 'status', 'updatedAt']);
+        allow delete: if isVerified() && isValidId(orgId) && isValidId(branchId) && isOrgAdminOrOwner(orgId);
+      }
+
+      // -----------------------------------------------------------------------
+      // Patients (Strict Clinical Privacy: No automatic Super Admin read)
+      // -----------------------------------------------------------------------
+      match /patients/{patientId} {
+        allow get: if isSignedIn() && isValidId(orgId) && isValidId(patientId) && (
+          isActiveMember(orgId) ||
+          (existing().patientAuthUid == request.auth.uid)
+        );
+        allow list: if isSignedIn() && (
+          existing().ownerUid == request.auth.uid ||
+          request.auth.uid in existing().authorizedUids ||
+          existing().patientAuthUid == request.auth.uid
+        );
+        allow create: if isVerified() && isValidId(orgId) && isValidId(patientId) && isValidPatient(incoming(), orgId) && incoming().createdByUid == request.auth.uid && incoming().createdAt == request.time && incoming().updatedAt == request.time && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'doctor', 'receptionist', 'nurse']) && incoming().ownerUid == getOrg(orgId).ownerUid;
+        allow update: if isVerified() && isValidId(orgId) && isValidId(patientId) && isValidPatient(incoming(), orgId) && isTenantImmutable() && incoming().updatedAt == request.time && (
+          (hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'doctor', 'receptionist', 'nurse']) && incoming().diff(existing()).affectedKeys().hasOnly(['authorizedUids', 'patientAuthUid', 'name', 'gender', 'dob', 'age', 'bloodGroup', 'phone', 'email', 'address', 'emergencyContact', 'guardianName', 'medicalHistory', 'allergies', 'existingDiseases', 'assignedDoctorId', 'assignedDoctorName', 'branchId', 'notes', 'status', 'updatedAt'])) ||
+          (existing().patientAuthUid == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['phone', 'email', 'address', 'emergencyContact', 'updatedAt']))
+        );
+        allow delete: if isVerified() && isValidId(orgId) && isValidId(patientId) && isOrgAdminOrOwner(orgId);
+      }
+
+      // -----------------------------------------------------------------------
+      // Doctors & Schedules
+      // -----------------------------------------------------------------------
+      match /doctors/{doctorId} {
+        allow get: if isSignedIn() && isValidId(orgId) && isValidId(doctorId) && isActiveMember(orgId);
+        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || request.auth.uid in existing().authorizedUids);
+        allow create: if isVerified() && isValidId(orgId) && isValidId(doctorId) && isValidDoctor(incoming(), orgId) && incoming().createdByUid == request.auth.uid && incoming().createdAt == request.time && incoming().updatedAt == request.time && isOrgAdminOrOwner(orgId) && incoming().ownerUid == getOrg(orgId).ownerUid;
+        allow update: if isVerified() && isValidId(orgId) && isValidId(doctorId) && isValidDoctor(incoming(), orgId) && isTenantImmutable() && incoming().updatedAt == request.time && (
+          (isOrgAdminOrOwner(orgId) && incoming().diff(existing()).affectedKeys().hasOnly(['authorizedUids', 'name', 'specialization', 'discipline', 'qualifications', 'registrationLabel', 'registrationNumber', 'phone', 'email', 'chamberInfo', 'branchId', 'consultationFee', 'followUpFee', 'experienceYears', 'slotDurationMinutes', 'availableDays', 'morningShift', 'eveningShift', 'breakTime', 'leaveDates', 'emergencyAvailable', 'status', 'updatedAt'])) ||
+          (hasMemberRole(orgId, ['doctor', 'receptionist']) && incoming().diff(existing()).affectedKeys().hasOnly(['availableDays', 'morningShift', 'eveningShift', 'breakTime', 'leaveDates', 'emergencyAvailable', 'status', 'updatedAt']))
+        );
+        allow delete: if isVerified() && isValidId(orgId) && isValidId(doctorId) && isOrgAdminOrOwner(orgId);
+      }
+
+      // -----------------------------------------------------------------------
+      // Appointments & Queue Tokens
+      // -----------------------------------------------------------------------
+      match /appointments/{appointmentId} {
+        allow get: if isSignedIn() && isValidId(orgId) && isValidId(appointmentId) && (
+          isActiveMember(orgId) ||
+          existing().patientAuthUid == request.auth.uid
+        );
+        allow list: if isSignedIn() && (
+          existing().ownerUid == request.auth.uid ||
+          request.auth.uid in existing().authorizedUids ||
+          existing().patientAuthUid == request.auth.uid
+        );
+        allow create: if isVerified() && isValidId(orgId) && isValidId(appointmentId) && isValidAppointment(incoming(), orgId) && incoming().createdByUid == request.auth.uid && incoming().createdAt == request.time && incoming().updatedAt == request.time && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'doctor', 'receptionist', 'nurse', 'patient']) && incoming().ownerUid == getOrg(orgId).ownerUid;
+        allow update: if isVerified() && isValidId(orgId) && isValidId(appointmentId) && isValidAppointment(incoming(), orgId) && isTenantImmutable() && incoming().updatedAt == request.time && (
+          (hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'doctor', 'receptionist', 'nurse']) && incoming().diff(existing()).affectedKeys().hasOnly(['authorizedUids', 'date', 'timeSlot', 'type', 'consultationFee', 'status', 'paymentStatus', 'notes', 'followUpDate', 'followUpReason', 'updatedAt'])) ||
+          (existing().patientAuthUid == request.auth.uid && existing().status in ['pending', 'confirmed'] && incoming().status == 'cancelled' && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'updatedAt']))
+        );
+        allow delete: if isVerified() && isValidId(orgId) && isValidId(appointmentId) && isOrgAdminOrOwner(orgId);
+      }
+
+      // -----------------------------------------------------------------------
+      // Digital Prescriptions (Terminal State Locked once 'finalized')
+      // -----------------------------------------------------------------------
+      match /prescriptions/{prescriptionId} {
+        allow get: if isSignedIn() && isValidId(orgId) && isValidId(prescriptionId) && (
+          hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'doctor', 'nurse', 'pharmacist']) ||
+          existing().patientAuthUid == request.auth.uid
+        );
+        allow list: if isSignedIn() && (
+          existing().ownerUid == request.auth.uid ||
+          request.auth.uid in existing().authorizedUids ||
+          existing().patientAuthUid == request.auth.uid
+        );
+        allow create: if isVerified() && isValidId(orgId) && isValidId(prescriptionId) && isValidPrescription(incoming(), orgId) && incoming().createdByUid == request.auth.uid && incoming().createdAt == request.time && incoming().updatedAt == request.time && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'doctor']) && incoming().ownerUid == getOrg(orgId).ownerUid;
+        allow update: if isVerified() && isValidId(orgId) && isValidId(prescriptionId) && isValidPrescription(incoming(), orgId) && isTenantImmutable() && incoming().updatedAt == request.time && (
+          (existing().status == 'draft' && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'doctor']) && incoming().diff(existing()).affectedKeys().hasOnly(['templateType', 'vitals', 'chiefComplaints', 'clinicalFindings', 'diagnosis', 'investigationAdvice', 'treatmentPlan', 'medicines', 'followUpDate', 'digitalSignature', 'status', 'updatedAt'])) ||
+          // Access-sync only (never mutates clinical content or finalized status)
+          (isOrgAdminOrOwner(orgId) && incoming().diff(existing()).affectedKeys().hasOnly(['authorizedUids', 'updatedAt']))
+        );
+        allow delete: if isVerified() && isValidId(orgId) && isValidId(prescriptionId) && existing().status == 'draft' && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'doctor']);
+      }
+
+      // -----------------------------------------------------------------------
+      // Diagnostic Lab Tests Catalog
+      // -----------------------------------------------------------------------
+      match /labTests/{testId} {
+        allow get: if isSignedIn() && isValidId(orgId) && isValidId(testId) && isActiveMember(orgId);
+        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || request.auth.uid in existing().authorizedUids);
+        allow create: if isVerified() && isValidId(orgId) && isValidId(testId) && isValidLabTest(incoming(), orgId) && incoming().createdByUid == request.auth.uid && incoming().createdAt == request.time && incoming().updatedAt == request.time && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'lab_technician', 'doctor']) && incoming().ownerUid == getOrg(orgId).ownerUid;
+        allow update: if isVerified() && isValidId(orgId) && isValidId(testId) && isValidLabTest(incoming(), orgId) && isTenantImmutable() && incoming().updatedAt == request.time && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'lab_technician']) && incoming().diff(existing()).affectedKeys().hasOnly(['authorizedUids', 'code', 'name', 'category', 'price', 'sampleType', 'preparation', 'referenceRange', 'unit', 'description', 'status', 'updatedAt']);
+        allow delete: if isVerified() && isValidId(orgId) && isValidId(testId) && isOrgAdminOrOwner(orgId);
+      }
+
+      // -----------------------------------------------------------------------
+      // Lab Orders & Results (Terminal Lock: Verified results are IMMUTABLE)
+      // -----------------------------------------------------------------------
+      match /labOrders/{orderId} {
+        allow get: if isSignedIn() && isValidId(orgId) && isValidId(orderId) && (
+          isActiveMember(orgId) ||
+          existing().patientAuthUid == request.auth.uid
+        );
+        allow list: if isSignedIn() && (
+          existing().ownerUid == request.auth.uid ||
+          request.auth.uid in existing().authorizedUids ||
+          existing().patientAuthUid == request.auth.uid
+        );
+        allow create: if isVerified() && isValidId(orgId) && isValidId(orderId) && isValidLabOrder(incoming(), orgId) && incoming().createdByUid == request.auth.uid && incoming().createdAt == request.time && incoming().updatedAt == request.time && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'doctor', 'receptionist', 'lab_technician']) && incoming().ownerUid == getOrg(orgId).ownerUid;
+        allow update: if isVerified() && isValidId(orgId) && isValidId(orderId) && isValidLabOrder(incoming(), orgId) && isTenantImmutable() && incoming().updatedAt == request.time && (
+          // Action 1: Pre-verification processing & result entry (Blocked once verified or delivered)
+          (existing().status in ['ordered', 'sample_pending', 'sample_collected', 'processing', 'completed']
+            && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'doctor', 'lab_technician'])
+            && incoming().diff(existing()).affectedKeys().hasOnly(['tests', 'status', 'technicianName', 'verifiedByName', 'verifiedAt', 'history', 'updatedAt'])) ||
+          // Action 2: Mark verified report as delivered (cannot modify tests!)
+          (existing().status == 'verified'
+            && incoming().status == 'delivered'
+            && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'lab_technician', 'receptionist'])
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'deliveredAt', 'history', 'updatedAt'])) ||
+          // Action 3: Access-sync only (never mutates verified lab tests or status)
+          (isOrgAdminOrOwner(orgId) && incoming().diff(existing()).affectedKeys().hasOnly(['authorizedUids', 'updatedAt']))
+        );
+        allow delete: if false;
+      }
+
+      // -----------------------------------------------------------------------
+      // Billing Invoices & Payments
+      // -----------------------------------------------------------------------
+      match /invoices/{invoiceId} {
+        allow get: if isSignedIn() && isValidId(orgId) && isValidId(invoiceId) && (
+          isActiveMember(orgId) ||
+          existing().patientAuthUid == request.auth.uid
+        );
+        allow list: if isSignedIn() && (
+          existing().ownerUid == request.auth.uid ||
+          request.auth.uid in existing().authorizedUids ||
+          existing().patientAuthUid == request.auth.uid
+        );
+        allow create: if isVerified() && isValidId(orgId) && isValidId(invoiceId) && isValidInvoice(incoming(), orgId) && incoming().createdByUid == request.auth.uid && incoming().createdAt == request.time && incoming().updatedAt == request.time && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'receptionist', 'accountant', 'pharmacist']) && incoming().ownerUid == getOrg(orgId).ownerUid;
+        allow update: if isVerified() && isValidId(orgId) && isValidId(invoiceId) && isValidInvoice(incoming(), orgId) && isTenantImmutable() && incoming().updatedAt == request.time && (
+          (existing().status != 'refunded' && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'receptionist', 'accountant']) && incoming().diff(existing()).affectedKeys().hasOnly(['items', 'subtotal', 'discount', 'taxRate', 'taxAmount', 'totalAmount', 'paidAmount', 'dueAmount', 'status', 'payments', 'updatedAt'])) ||
+          (isOrgAdminOrOwner(orgId) && incoming().diff(existing()).affectedKeys().hasOnly(['authorizedUids', 'updatedAt']))
+        );
+        allow delete: if false;
+      }
+
+      // -----------------------------------------------------------------------
+      // Expenses Ledger
+      // -----------------------------------------------------------------------
+      match /expenses/{expenseId} {
+        allow get: if isSignedIn() && isValidId(orgId) && isValidId(expenseId) && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'accountant']);
+        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || request.auth.uid in existing().authorizedUids);
+        allow create: if isVerified() && isValidId(orgId) && isValidId(expenseId) && isValidExpense(incoming(), orgId) && incoming().createdByUid == request.auth.uid && incoming().createdAt == request.time && incoming().updatedAt == request.time && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'accountant']) && incoming().ownerUid == getOrg(orgId).ownerUid;
+        allow update: if isVerified() && isValidId(orgId) && isValidId(expenseId) && isValidExpense(incoming(), orgId) && isTenantImmutable() && incoming().updatedAt == request.time && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'accountant']) && incoming().diff(existing()).affectedKeys().hasOnly(['authorizedUids', 'title', 'category', 'amount', 'date', 'paymentMethod', 'vendor', 'branchId', 'notes', 'updatedAt']);
+        allow delete: if isVerified() && isValidId(orgId) && isValidId(expenseId) && isOrgAdminOrOwner(orgId);
+      }
+
+      // -----------------------------------------------------------------------
+      // Pharmacy Inventory
+      // -----------------------------------------------------------------------
+      match /pharmacyInventory/{itemId} {
+        allow get: if isSignedIn() && isValidId(orgId) && isValidId(itemId) && isActiveMember(orgId);
+        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || request.auth.uid in existing().authorizedUids);
+        allow create: if isVerified() && isValidId(orgId) && isValidId(itemId) && isValidPharmacyItem(incoming(), orgId) && incoming().createdByUid == request.auth.uid && incoming().createdAt == request.time && incoming().updatedAt == request.time && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'pharmacist']) && incoming().ownerUid == getOrg(orgId).ownerUid;
+        allow update: if isVerified() && isValidId(orgId) && isValidId(itemId) && isValidPharmacyItem(incoming(), orgId) && isTenantImmutable() && incoming().updatedAt == request.time && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'pharmacist']) && incoming().diff(existing()).affectedKeys().hasOnly(['authorizedUids', 'brandName', 'genericName', 'manufacturer', 'batchNumber', 'barcode', 'supplierName', 'purchasePrice', 'sellingPrice', 'stockQty', 'reorderLevel', 'expiryDate', 'status', 'updatedAt']);
+        allow delete: if isVerified() && isValidId(orgId) && isValidId(itemId) && isOrgAdminOrOwner(orgId);
+      }
+
+      // -----------------------------------------------------------------------
+      // Inpatient Beds & Cabins
+      // -----------------------------------------------------------------------
+      match /beds/{bedId} {
+        allow get: if isSignedIn() && isValidId(orgId) && isValidId(bedId) && isActiveMember(orgId);
+        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || request.auth.uid in existing().authorizedUids);
+        allow create: if isVerified() && isValidId(orgId) && isValidId(bedId) && isValidBed(incoming(), orgId) && incoming().createdByUid == request.auth.uid && incoming().createdAt == request.time && incoming().updatedAt == request.time && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'nurse', 'receptionist']) && incoming().ownerUid == getOrg(orgId).ownerUid;
+        allow update: if isVerified() && isValidId(orgId) && isValidId(bedId) && isValidBed(incoming(), orgId) && isTenantImmutable() && incoming().updatedAt == request.time && hasMemberRole(orgId, ['clinic_owner', 'clinic_admin', 'doctor', 'nurse', 'receptionist']) && incoming().diff(existing()).affectedKeys().hasOnly(['authorizedUids', 'wardName', 'roomNumber', 'bedNumber', 'type', 'dailyRate', 'status', 'currentPatientId', 'currentPatientName', 'admittedAt', 'attendingDoctorName', 'nursingNotes', 'updatedAt']);
+        allow delete: if isVerified() && isValidId(orgId) && isValidId(bedId) && isOrgAdminOrOwner(orgId);
+      }
+
+      // -----------------------------------------------------------------------
+      // Notifications Queue
+      // -----------------------------------------------------------------------
+      match /notifications/{notifId} {
+        allow get: if isSignedIn() && isValidId(orgId) && isValidId(notifId) && isActiveMember(orgId);
+        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || request.auth.uid in existing().authorizedUids);
+        allow create: if isVerified() && isValidId(orgId) && isValidId(notifId) && isValidNotification(incoming(), orgId) && incoming().createdByUid == request.auth.uid && incoming().createdAt == request.time && incoming().updatedAt == request.time && isActiveMember(orgId) && incoming().ownerUid == getOrg(orgId).ownerUid;
+        allow update: if isVerified() && isValidId(orgId) && isValidId(notifId) && isValidNotification(incoming(), orgId) && isTenantImmutable() && incoming().updatedAt == request.time && (
+          (isActiveMember(orgId) && incoming().diff(existing()).affectedKeys().hasOnly(['read', 'deliveryStatus', 'updatedAt'])) ||
+          (isOrgAdminOrOwner(orgId) && incoming().diff(existing()).affectedKeys().hasOnly(['authorizedUids', 'updatedAt']))
+        );
+        allow delete: if isVerified() && isValidId(orgId) && isValidId(notifId) && isOrgAdminOrOwner(orgId);
+      }
+
+      // -----------------------------------------------------------------------
+      // Immutable Audit Logs (Append-Only)
+      // -----------------------------------------------------------------------
+      match /auditLogs/{logId} {
+        allow get: if isSignedIn() && isValidId(orgId) && isValidId(logId) && isOrgAdminOrOwner(orgId);
+        allow list: if isSignedIn() && (existing().ownerUid == request.auth.uid || request.auth.uid in existing().authorizedUids);
+        allow create: if isVerified() && isValidId(orgId) && isValidId(logId) && isValidAuditLog(incoming(), orgId) && incoming().actorUid == request.auth.uid && incoming().createdAt == request.time && isActiveMember(orgId) && incoming().ownerUid == getOrg(orgId).ownerUid;
+        allow update, delete: if false;
+      }
+    }
+  }
+}

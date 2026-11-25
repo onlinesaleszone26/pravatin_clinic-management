@@ -1,0 +1,8 @@
+{
+  "name": "MediCare Pro",
+  "description": "Multi-tenant Clinic Management SaaS Platform with Patient Registry, Doctor Scheduling, Appointments, Digital Prescriptions, Laboratory Reports, Pharmacy, Billing, and RBAC.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
