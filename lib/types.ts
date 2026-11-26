@@ -1,9 +1,4 @@
-export type CurrencyCode = 'USD' | 'EUR' | 'BDT';
-export type LanguageCode = 'en' | 'bn';
-export type ThemeMode = 'light' | 'dark';
-
-export type OrganizationType = 'clinic' | 'diagnostic' | 'hospital' | 'chamber';
-export type OrganizationStatus = 'active' | 'trial' | 'suspended';
+import { Timestamp } from 'firebase/firestore';
 
 export type StaffRole =
   | 'clinic_owner'
@@ -17,43 +12,135 @@ export type StaffRole =
   | 'hr_manager'
   | 'patient';
 
+export type ModuleKey =
+  | 'dashboard'
+  | 'patients'
+  | 'doctors'
+  | 'appointments'
+  | 'prescriptions'
+  | 'laboratory'
+  | 'billing'
+  | 'pharmacy'
+  | 'beds'
+  | 'staff'
+  | 'branches'
+  | 'notifications'
+  | 'reports'
+  | 'settings'
+  | 'patient_portal'
+  | 'super_admin';
+
+export interface ModulePermission {
+  view: boolean;
+  create: boolean;
+  edit: boolean;
+  delete: boolean;
+}
+
+export type RolePermissionMap = Record<string, ModulePermission>;
+
+export interface UserProfile {
+  uid: string;
+  email: string;
+  displayName: string;
+  photoURL?: string;
+  phone?: string;
+  activeOrgId?: string;
+  language?: 'en' | 'bn';
+  theme?: 'light' | 'dark';
+  createdAt?: Timestamp;
+  updatedAt?: Timestamp;
+}
+
+export interface SubscriptionPlan {
+  id: string;
+  name: string;
+  code: 'starter' | 'professional' | 'enterprise' | 'custom';
+  audience?: string;
+  monthlyPrice: number;
+  yearlyPrice: number;
+  currency?: string;
+  trialDays?: number;
+  doctorLimit: number;
+  patientLimit: number;
+  userLimit?: number;
+  branchLimit?: number;
+  storageGb?: number;
+  modules?: string[];
+  isPublic: boolean;
+  createdAt?: Timestamp;
+  updatedAt?: Timestamp;
+}
+
+export interface PlatformSetting {
+  id: string;
+  platformName: string;
+  contactEmail?: string;
+  contactPhone?: string;
+  defaultCurrency: string;
+  defaultLanguage: 'en' | 'bn';
+  smsProviderMode?: 'disabled' | 'test_mode' | 'configured';
+  whatsappProviderMode?: 'disabled' | 'test_mode' | 'configured';
+  paymentGatewayMode?: 'manual' | 'test_mode' | 'configured';
+  maintenanceMode: boolean;
+  isPublic: boolean;
+  updatedAt?: Timestamp;
+}
+
+export interface PlatformTransaction {
+  id: string;
+  organizationId: string;
+  organizationName: string;
+  ownerUid: string;
+  planId: string;
+  planName: string;
+  billingCycle: 'monthly' | 'yearly';
+  amount: number;
+  currency: string;
+  method?: string;
+  reference?: string;
+  status: 'pending' | 'approved' | 'refunded' | 'overdue';
+  createdAt?: Timestamp;
+  updatedAt?: Timestamp;
+}
+
 export interface Organization {
   id: string;
   name: string;
   slug: string;
-  type: OrganizationType;
+  type: 'clinic' | 'diagnostic' | 'hospital' | 'chamber';
   ownerUid: string;
   authorizedUids: string[];
-  status: OrganizationStatus;
+  status: 'active' | 'trial' | 'suspended';
   planId: string;
   billingCycle?: 'monthly' | 'yearly';
   address?: string;
   phone?: string;
   email?: string;
   website?: string;
-  currency: CurrencyCode;
+  currency: 'BDT' | 'USD' | 'EUR';
   timezone?: string;
-  language: LanguageCode;
+  language: 'en' | 'bn';
   prescriptionHeader?: string;
   prescriptionFooter?: string;
   invoiceFooter?: string;
   enablePharmacy?: boolean;
   enableInpatient?: boolean;
-  createdAt: string;
-  updatedAt: string;
+  createdAt?: Timestamp;
+  updatedAt?: Timestamp;
 }
 
-export interface TenantDocument {
+export interface TenantBase {
   id: string;
   organizationId: string;
   ownerUid: string;
   authorizedUids: string[];
   createdByUid: string;
-  createdAt: string;
-  updatedAt: string;
+  createdAt?: Timestamp;
+  updatedAt?: Timestamp;
 }
 
-export interface OrganizationMember extends TenantDocument {
+export interface OrganizationMember extends TenantBase {
   uid: string;
   staffCode?: string;
   name: string;
@@ -90,11 +177,18 @@ export interface StaffInvite {
   acceptedByUid?: string;
   acceptedAt?: string;
   createdByUid: string;
-  createdAt: string;
-  updatedAt: string;
+  createdAt?: Timestamp;
+  updatedAt?: Timestamp;
 }
 
-export interface Branch extends TenantDocument {
+export interface CustomRole extends TenantBase {
+  name: string;
+  baseRole?: string;
+  description?: string;
+  permissions: RolePermissionMap;
+}
+
+export interface Branch extends TenantBase {
   name: string;
   code: string;
   address?: string;
@@ -104,7 +198,7 @@ export interface Branch extends TenantDocument {
   status: 'active' | 'inactive';
 }
 
-export interface Patient extends TenantDocument {
+export interface Patient extends TenantBase {
   patientAuthUid?: string;
   patientCode: string;
   name: string;
@@ -127,7 +221,7 @@ export interface Patient extends TenantDocument {
   status: 'active' | 'archived';
 }
 
-export interface Doctor extends TenantDocument {
+export interface Doctor extends TenantBase {
   doctorCode: string;
   name: string;
   specialization: string;
@@ -161,7 +255,7 @@ export type AppointmentStatus =
   | 'cancelled'
   | 'no_show';
 
-export interface Appointment extends TenantDocument {
+export interface Appointment extends TenantBase {
   patientAuthUid?: string;
   appointmentNumber: string;
   queueToken: number;
@@ -182,23 +276,25 @@ export interface Appointment extends TenantDocument {
   followUpReason?: string;
 }
 
-export interface PrescriptionMedicine {
+export interface PrescribedMedicine {
   name: string;
+  genericName: string;
   dosage: string;
+  route: string;
   frequency: string;
   duration: string;
+  quantity: string;
   instructions: string;
 }
 
 export interface PrescriptionVitals {
+  weight?: string;
   bp?: string;
   pulse?: string;
-  temp?: string;
-  weight?: string;
-  spo2?: string;
+  temperature?: string;
 }
 
-export interface Prescription extends TenantDocument {
+export interface Prescription extends TenantBase {
   patientAuthUid?: string;
   rxNumber: string;
   appointmentId?: string;
@@ -218,13 +314,13 @@ export interface Prescription extends TenantDocument {
   diagnosis?: string;
   investigationAdvice?: string;
   treatmentPlan?: string;
-  medicines: PrescriptionMedicine[];
+  medicines: PrescribedMedicine[];
   followUpDate?: string;
   digitalSignature?: string;
   status: 'draft' | 'finalized';
 }
 
-export interface LabTest extends TenantDocument {
+export interface LabTest extends TenantBase {
   code: string;
   name: string;
   category: string;
@@ -237,17 +333,6 @@ export interface LabTest extends TenantDocument {
   status: 'active' | 'inactive';
 }
 
-export interface LabOrderTestItem {
-  testId: string;
-  code: string;
-  name: string;
-  price: number;
-  resultValue?: string;
-  unit?: string;
-  referenceRange?: string;
-  flag?: 'normal' | 'high' | 'low' | 'critical';
-}
-
 export type LabOrderStatus =
   | 'ordered'
   | 'sample_pending'
@@ -258,7 +343,26 @@ export type LabOrderStatus =
   | 'delivered'
   | 'cancelled';
 
-export interface LabOrder extends TenantDocument {
+export interface LabOrderTestItem {
+  testId: string;
+  code: string;
+  name: string;
+  price: number;
+  referenceRange: string;
+  unit: string;
+  resultValue: string;
+  isAbnormal: boolean;
+  remarks: string;
+}
+
+export interface LabOrderAuditEntry {
+  action: string;
+  by: string;
+  at: string;
+  note?: string;
+}
+
+export interface LabOrder extends TenantBase {
   patientAuthUid?: string;
   orderNumber: string;
   patientId: string;
@@ -273,32 +377,34 @@ export interface LabOrder extends TenantDocument {
   verifiedByName?: string;
   verifiedAt?: string;
   deliveredAt?: string;
-  history: { action: string; by: string; at: string }[];
+  history: LabOrderAuditEntry[];
 }
 
-export interface InvoiceItem {
+export interface InvoiceLineItem {
+  category: 'consultation' | 'lab' | 'procedure' | 'pharmacy' | 'bed' | 'other';
   description: string;
-  category: 'consultation' | 'lab' | 'pharmacy' | 'bed' | 'other';
-  quantity: number;
+  qty: number;
   unitPrice: number;
   total: number;
 }
 
 export interface InvoicePayment {
+  id: string;
   amount: number;
-  method: 'Cash' | 'bKash' | 'Nagad' | 'Card' | 'Bank';
-  reference?: string;
+  method: 'cash' | 'bkash' | 'nagad' | 'card' | 'bank_transfer' | 'mobile_banking';
+  reference: string;
   paidAt: string;
+  recordedBy: string;
 }
 
-export interface Invoice extends TenantDocument {
+export interface Invoice extends TenantBase {
   patientAuthUid?: string;
   invoiceNumber: string;
   patientId: string;
   patientName: string;
   patientCode?: string;
   branchId?: string;
-  items: InvoiceItem[];
+  items: InvoiceLineItem[];
   subtotal: number;
   discount: number;
   taxRate: number;
@@ -310,7 +416,7 @@ export interface Invoice extends TenantDocument {
   payments: InvoicePayment[];
 }
 
-export interface Expense extends TenantDocument {
+export interface Expense extends TenantBase {
   title: string;
   category: string;
   amount: number;
@@ -321,7 +427,7 @@ export interface Expense extends TenantDocument {
   notes?: string;
 }
 
-export interface PharmacyItem extends TenantDocument {
+export interface PharmacyItem extends TenantBase {
   brandName: string;
   genericName: string;
   manufacturer?: string;
@@ -336,22 +442,7 @@ export interface PharmacyItem extends TenantDocument {
   status: 'active' | 'discontinued';
 }
 
-export interface PharmacySale {
-  id: string;
-  receiptNumber: string;
-  customerName: string;
-  customerType: 'registered' | 'walk_in';
-  patientId?: string;
-  prescriptionId?: string;
-  items: { itemId: string; brandName: string; genericName: string; qty: number; unitPrice: number; total: number }[];
-  subtotal: number;
-  discount: number;
-  total: number;
-  paymentMethod: 'Cash' | 'bKash' | 'Nagad' | 'Card' | 'Bank';
-  createdAt: string;
-}
-
-export interface Bed extends TenantDocument {
+export interface Bed extends TenantBase {
   wardName: string;
   roomNumber?: string;
   bedNumber: string;
@@ -363,6 +454,17 @@ export interface Bed extends TenantDocument {
   admittedAt?: string;
   attendingDoctorName?: string;
   nursingNotes?: string;
+}
+
+export interface NotificationRecord extends TenantBase {
+  type: string;
+  channel: 'in_app' | 'email' | 'sms' | 'whatsapp';
+  recipientName: string;
+  recipientContact?: string;
+  language: 'en' | 'bn';
+  message: string;
+  deliveryStatus: 'queued' | 'test_simulated' | 'sent' | 'failed';
+  read: boolean;
 }
 
 export interface AuditLog {
@@ -377,38 +479,37 @@ export interface AuditLog {
   actorUid: string;
   actorName: string;
   actorRole: string;
-  createdAt: string;
+  createdAt?: Timestamp;
 }
 
-export interface SubscriptionPlan {
-  id: string;
-  name: string;
-  code: 'starter' | 'professional' | 'enterprise' | 'custom';
-  audience?: string;
-  monthlyPrice: number;
-  yearlyPrice: number;
-  currency?: CurrencyCode;
-  trialDays?: number;
-  doctorLimit: number;
-  patientLimit: number;
-  userLimit?: number;
-  branchLimit?: number;
-  storageGb?: number;
-  modules?: string[];
-  isPublic: boolean;
-}
+export const DEFAULT_ROLE_MODULES: Record<StaffRole, ModuleKey[]> = {
+  clinic_owner: [
+    'dashboard', 'patients', 'doctors', 'appointments', 'prescriptions', 'laboratory',
+    'billing', 'pharmacy', 'beds', 'staff', 'branches', 'notifications', 'reports', 'settings', 'patient_portal',
+  ],
+  clinic_admin: [
+    'dashboard', 'patients', 'doctors', 'appointments', 'prescriptions', 'laboratory',
+    'billing', 'pharmacy', 'beds', 'staff', 'branches', 'notifications', 'reports', 'settings',
+  ],
+  doctor: ['dashboard', 'patients', 'doctors', 'appointments', 'prescriptions', 'laboratory', 'beds', 'notifications'],
+  receptionist: ['dashboard', 'patients', 'doctors', 'appointments', 'billing', 'beds', 'notifications'],
+  nurse: ['dashboard', 'patients', 'appointments', 'prescriptions', 'beds', 'notifications'],
+  lab_technician: ['dashboard', 'laboratory', 'notifications'],
+  pharmacist: ['dashboard', 'prescriptions', 'pharmacy', 'billing', 'notifications'],
+  accountant: ['dashboard', 'billing', 'reports'],
+  hr_manager: ['dashboard', 'staff', 'branches', 'reports'],
+  patient: ['patient_portal'],
+};
 
-export type ActiveModule =
-  | 'dashboard'
-  | 'patients'
-  | 'doctors'
-  | 'appointments'
-  | 'prescriptions'
-  | 'laboratory'
-  | 'billing'
-  | 'pharmacy'
-  | 'beds'
-  | 'staff'
-  | 'settings'
-  | 'patient_portal'
-  | 'super_admin';
+export const ROLE_LABELS: Record<StaffRole, { en: string }> = {
+  clinic_owner: { en: 'Clinic Owner' },
+  clinic_admin: { en: 'Clinic Admin' },
+  doctor: { en: 'Doctor' },
+  receptionist: { en: 'Receptionist' },
+  nurse: { en: 'Nurse' },
+  lab_technician: { en: 'Lab Technician' },
+  pharmacist: { en: 'Pharmacist' },
+  accountant: { en: 'Accountant' },
+  hr_manager: { en: 'HR Manager' },
+  patient: { en: 'Patient' },
+};
